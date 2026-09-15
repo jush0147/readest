@@ -15,6 +15,7 @@ jobs:
   build-clone:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
     steps:
       - name: Setup Java
         uses: actions/setup-java@v5
@@ -26,15 +27,181 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y apktool
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager 'build-tools;36.0.0'
+
+          SDKMANAGER=/usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager
+
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" 'build-tools;36.0.0'
 
       - name: Download official Readest 0.11.17 arm64 APK
         run: |
           curl -fL --retry 3 \
             -o Readest_0.11.17_arm64.apk \
             'https://github.com/readest/readest/releases/download/v0.11.17/Readest_0.11.17_arm64.apk'
+
           unzip -t Readest_0.11.17_arm64.apk >/dev/null
+
+      - name: Decode and patch package identity
+        run: |
+          apktool d -f Readest_0.11.17_arm64.apk -o decoded
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          manifest = Path("decoded/AndroidManifest.xml")
+
+          tree = ET.parse(manifest)
+          root = tree.getroot()
+
+          android = "{http://schemas.android.com/apk/res/android}"
+
+          old = "com.bilingify.readest"
+          new = "com.bilingify.readest.v01117"
+
+          component_tags = {
+              "application",
+              "activity",
+              "activity-alias",
+              "service",
+              "receiver",
+              "provider",
+          }
+
+          # Relative component names such as .MainActivity depend on
+          # the manifest package. Expand them before changing it so
+          # the original compiled Java/Kotlin classes are still used.
+          for elem in root.iter():
+              tag = elem.tag.rsplit("}", 1)[-1]
+
+              if tag in component_tags:
+                  name_key = android + "name"
+                  name = elem.attrib.get(name_key)
+
+                  if name and name.startswith("."):
+                      elem.set(name_key, old + name)
+
+          # Make Android treat this as a separate app.
+          root.set("package", new)
+
+          # Avoid collisions with the normal Play Store installation.
+          for elem in root.iter():
+              for key, value in list(elem.attrib.items()):
+                  local = key.rsplit("}", 1)[-1]
+
+                  if local in {
+                      "authorities",
+                      "permission",
+                      "readPermission",
+                      "writePermission",
+                      "taskAffinity",
+                  }:
+                      if old in value:
+                          elem.set(key, value.replace(old, new))
+
+              tag = elem.tag.rsplit("}", 1)[-1]
+              name_key = android + "name"
+
+              if tag in {
+                  "permission",
+                  "permission-tree",
+                  "permission-group",
+                  "uses-permission",
+              }:
+                  value = elem.attrib.get(name_key)
+
+                  if value and value.startswith(old):
+                      elem.set(
+                          name_key,
+                          value.replace(old, new, 1),
+                      )
+
+          ET.register_namespace(
+              "android",
+              "http://schemas.android.com/apk/res/android",
+          )
+
+          tree.write(
+              manifest,
+              encoding="utf-8",
+              xml_declaration=True,
+          )
+
+          text = manifest.read_text(encoding="utf-8")
+
+          assert 'package="com.bilingify.readest.v01117"' in text
+          assert 'android:name="com.bilingify.readest.MainActivity"' in text
+
+          print("Patched manifest package to:", new)
+          PY
+
+      - name: Rebuild APK
+        run: |
+          apktool b decoded -o clone-unsigned.apk
+
+      - name: Generate signing key and sign clone
+        env:
+          STOREPASS: readest-clone-local
+        run: |
+          keytool -genkeypair -v \
+            -keystore clone.jks \
+            -storepass "$STOREPASS" \
+            -keypass "$STOREPASS" \
+            -alias clone \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname 'CN=Readest 0.11.17 Clone, OU=Local Build, O=Jush, L=Tainan, C=TW'
+
+          BT=/usr/local/lib/android/sdk/build-tools/36.0.0
+
+          "$BT/zipalign" \
+            -f \
+            -p \
+            4 \
+            clone-unsigned.apk \
+            clone-aligned.apk
+
+          "$BT/apksigner" sign \
+            --ks clone.jks \
+            --ks-pass "pass:$STOREPASS" \
+            --key-pass "pass:$STOREPASS" \
+            --ks-key-alias clone \
+            --out Readest_0.11.17_arm64_clone.apk \
+            clone-aligned.apk
+
+          "$BT/apksigner" verify \
+            --verbose \
+            --print-certs \
+            Readest_0.11.17_arm64_clone.apk
+
+      - name: Verify clone APK
+        run: |
+          BT=/usr/local/lib/android/sdk/build-tools/36.0.0
+
+          "$BT/aapt2" dump xmltree \
+            Readest_0.11.17_arm64_clone.apk \
+            --file AndroidManifest.xml \
+            > manifest-dump.txt
+
+          grep -q 'com.bilingify.readest.v01117' manifest-dump.txt
+          grep -q 'readest' manifest-dump.txt
+
+          sha256sum \
+            Readest_0.11.17_arm64_clone.apk \
+            > SHA256SUMS.txt
+
+          cat SHA256SUMS.txt
+
+      - name: Upload clone APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Readest-0.11.17-arm64-clone
+          path: |
+            Readest_0.11.17_arm64_clone.apk
+            SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30          unzip -t Readest_0.11.17_arm64.apk >/dev/null
 
       - name: Decode and patch package identity
         run: |
