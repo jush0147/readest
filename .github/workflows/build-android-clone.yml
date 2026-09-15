@@ -6,6 +6,7 @@ on:
       - android-v0.11.17-clone
     paths:
       - '.github/workflows/build-android-clone.yml'
+      - '.github/scripts/badge-readest-icon.sh'
   workflow_dispatch:
 
 permissions:
@@ -17,6 +18,9 @@ jobs:
     timeout-minutes: 20
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Setup Java
         uses: actions/setup-java@v5
         with:
@@ -26,9 +30,13 @@ jobs:
       - name: Setup Android build tools
         run: |
           SDKMANAGER=/usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager
-
           yes | "$SDKMANAGER" --licenses >/dev/null || true
           "$SDKMANAGER" 'build-tools;36.0.0'
+
+      - name: Setup image tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y imagemagick fonts-dejavu-core
 
       - name: Download Apktool 3.0.3
         run: |
@@ -56,21 +64,20 @@ jobs:
             Readest_0.11.17_arm64.apk \
             -o decoded
 
-      - name: Patch package identity
+      - name: Patch package identity and app label
         run: |
           python3 - <<'PY'
           from pathlib import Path
           import xml.etree.ElementTree as ET
 
           manifest = Path("decoded/AndroidManifest.xml")
-
           tree = ET.parse(manifest)
           root = tree.getroot()
-
           android = "{http://schemas.android.com/apk/res/android}"
 
           old = "com.bilingify.readest"
           new = "com.bilingify.readest.v01117"
+          clone_label = "Readest 0.11.17"
 
           component_tags = {
               "application",
@@ -81,48 +88,39 @@ jobs:
               "provider",
           }
 
-          # Preserve the actual compiled component class names.
-          # Example:
-          # .MainActivity
-          # becomes
-          # com.bilingify.readest.MainActivity
-          #
-          # This must happen before changing the manifest package.
           for elem in root.iter():
               tag = elem.tag.rsplit("}", 1)[-1]
 
               if tag in component_tags:
                   key = android + "name"
                   name = elem.attrib.get(key)
-
                   if name and name.startswith("."):
                       elem.set(key, old + name)
 
-          # Give the cloned APK its own Android package ID.
           root.set("package", new)
 
-          # Change things that must be unique between installed apps,
-          # such as FileProvider authorities and app-defined permissions.
+          application = root.find("application")
+          if application is not None:
+              application.set(android + "label", clone_label)
+
           for elem in root.iter():
+              tag = elem.tag.rsplit("}", 1)[-1]
+              name = elem.attrib.get(android + "name")
+              if tag == "activity" and name == old + ".MainActivity":
+                  elem.set(android + "label", clone_label)
+
               for key, value in list(elem.attrib.items()):
                   local = key.rsplit("}", 1)[-1]
-
                   if local in {
                       "authorities",
                       "permission",
                       "readPermission",
                       "writePermission",
                       "taskAffinity",
-                  }:
-                      if old in value:
-                          elem.set(
-                              key,
-                              value.replace(old, new),
-                          )
+                  } and old in value:
+                      elem.set(key, value.replace(old, new))
 
-              tag = elem.tag.rsplit("}", 1)[-1]
               key = android + "name"
-
               if tag in {
                   "permission",
                   "permission-tree",
@@ -130,12 +128,8 @@ jobs:
                   "uses-permission",
               }:
                   value = elem.attrib.get(key)
-
                   if value and value.startswith(old):
-                      elem.set(
-                          key,
-                          value.replace(old, new, 1),
-                      )
+                      elem.set(key, value.replace(old, new, 1))
 
           ET.register_namespace(
               "android",
@@ -148,27 +142,18 @@ jobs:
               xml_declaration=True,
           )
 
-          text = manifest.read_text(
-              encoding="utf-8",
-          )
+          text = manifest.read_text(encoding="utf-8")
+          assert 'package="com.bilingify.readest.v01117"' in text
+          assert 'android:name="com.bilingify.readest.MainActivity"' in text
+          assert 'android:label="Readest 0.11.17"' in text
 
-          assert (
-              'package="com.bilingify.readest.v01117"'
-              in text
-          )
-
-          assert (
-              'android:name="com.bilingify.readest.MainActivity"'
-              in text
-          )
-
-          print(
-              "Patched package:",
-              old,
-              "->",
-              new,
-          )
+          print("Patched package:", old, "->", new)
+          print("Clone label:", clone_label)
           PY
+
+      - name: Add 11 badge to launcher icon
+        run: |
+          bash .github/scripts/badge-readest-icon.sh decoded
 
       - name: Rebuild APK
         run: |
@@ -226,13 +211,9 @@ jobs:
             --file AndroidManifest.xml \
             > manifest-dump.txt
 
-          grep -q \
-            'com.bilingify.readest.v01117' \
-            manifest-dump.txt
-
-          grep -q \
-            'com.bilingify.readest.MainActivity' \
-            manifest-dump.txt
+          grep -q 'com.bilingify.readest.v01117' manifest-dump.txt
+          grep -q 'com.bilingify.readest.MainActivity' manifest-dump.txt
+          grep -q 'Readest 0.11.17' manifest-dump.txt
 
           sha256sum \
             Readest_0.11.17_arm64_clone.apk \
@@ -243,7 +224,7 @@ jobs:
       - name: Upload clone APK
         uses: actions/upload-artifact@v4
         with:
-          name: Readest-0.11.17-arm64-clone
+          name: Readest-0.11.17-arm64-clone-badged
           path: |
             Readest_0.11.17_arm64_clone.apk
             SHA256SUMS.txt
